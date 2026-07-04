@@ -1,0 +1,5 @@
+*.txt
+*.log
+state/
+log/*.jsonl
+__pycache__/
