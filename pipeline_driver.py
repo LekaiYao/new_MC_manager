@@ -2,19 +2,24 @@ import argparse
 import sys
 
 from pipeline_core import (
-    ALLOWED_STEPS,
     STATE_FILE,
+    TABLE_FILE,
     append_event,
+    build_submit_plan,
+    check_active_samples,
     collect_step_status,
+    load_config,
     load_pipeline_state,
+    render_active_summary,
     render_step_report,
-    save_pipeline_state,
+    render_submit_plan,
+    write_table,
 )
 
 
 def cmd_check(args):
-    payload = collect_step_status(args.step, write_legacy_logs=True)
-    save_pipeline_state(payload)
+    config = load_config()
+    payload = collect_step_status(args.step, write_legacy_logs=True, config=config)
     append_event(
         'check',
         {
@@ -24,28 +29,52 @@ def cmd_check(args):
         },
     )
     print(render_step_report(payload))
+    return 0
+
+
+def cmd_check_active(args):
+    config = load_config()
+    state, checked, skipped_ready, skipped_complete = check_active_samples(config=config)
+    print(render_active_summary(checked, skipped_ready, skipped_complete))
     print('\nstate saved to: {0}'.format(STATE_FILE))
     return 0
 
 
 def cmd_report(args):
-    state = load_pipeline_state()
-    if not state.get('steps'):
-        print('no pipeline state found at {0}'.format(STATE_FILE))
-        return 1
+    state = load_pipeline_state(load_config())
+    print('samples in state: {0}'.format(len(state.get('samples', {}))))
+    for sample_id in sorted(state.get('samples', {}).keys()):
+        sample = state['samples'][sample_id]
+        print('{0}: current_step={1}, current_status={2}, ready={3}, complete={4}'.format(
+            sample_id,
+            sample.get('current_step'),
+            sample.get('current_status'),
+            sample.get('ready_for_next_step'),
+            sample.get('workflow_complete'),
+        ))
+    return 0
 
-    selected_steps = [args.step] if args.step else sorted(state['steps'].keys())
-    missing_steps = [step for step in selected_steps if step not in state['steps']]
-    if missing_steps:
-        print('missing state for steps: ' + ', '.join(missing_steps))
-        return 1
 
-    for index, step in enumerate(selected_steps):
-        if index:
-            print()
-        print(render_step_report(state['steps'][step]))
+def cmd_table(args):
+    config = load_config()
+    state = load_pipeline_state(config)
+    table_file = write_table(state, config=config)
+    print('table written to: {0}'.format(table_file))
+    return 0
 
-    append_event('report', {'steps': selected_steps})
+
+def cmd_submit_next(args):
+    config = load_config()
+    state = load_pipeline_state(config)
+    plan = build_submit_plan(state, config=config)
+    append_event(
+        'submit-next-dry-run',
+        {
+            'planned_submissions': len(plan.get('submissions', [])),
+            'blocked_lineages': len(plan.get('blocked', [])),
+        },
+    )
+    print(render_submit_plan(plan))
     return 0
 
 
@@ -56,17 +85,34 @@ def build_parser():
 
     check_parser = subparsers.add_parser(
         'check',
-        help='run crab status for one step, update pipeline_state.json, and keep legacy logs',
+        help='run crab status for one step and keep legacy logs',
     )
-    check_parser.add_argument('step', choices=sorted(ALLOWED_STEPS))
+    check_parser.add_argument('step', choices=sorted(load_config()['allowed_steps']))
     check_parser.set_defaults(func=cmd_check)
+
+    active_parser = subparsers.add_parser(
+        'check-active',
+        help='check only the latest unfinished step for each sample',
+    )
+    active_parser.set_defaults(func=cmd_check_active)
 
     report_parser = subparsers.add_parser(
         'report',
-        help='print a summary from pipeline_state.json',
+        help='print a compact per-sample state summary',
     )
-    report_parser.add_argument('--step', choices=sorted(ALLOWED_STEPS))
     report_parser.set_defaults(func=cmd_report)
+
+    table_parser = subparsers.add_parser(
+        'table',
+        help='write a Markdown table of completed-step output datasets',
+    )
+    table_parser.set_defaults(func=cmd_table)
+
+    submit_parser = subparsers.add_parser(
+        'submit-next',
+        help='dry-run planner for the next-step submissions of ready lineages',
+    )
+    submit_parser.set_defaults(func=cmd_submit_next)
 
     return parser
 

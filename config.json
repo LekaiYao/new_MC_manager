@@ -1,0 +1,24 @@
+{
+  "terminal_step": "MINIAOD",
+  "finished_threshold_pct": 95,
+  "proxy_min_timeleft_seconds": 43200,
+  "steps": ["GEN", "SIM", "DIGI", "HLT", "RECO", "MINIAOD", "NTUPLE"],
+  "step_dirs": {
+    "GEN": "../CMSSW_10_6_20_patch1/src",
+    "SIM": "../CMSSW_10_6_17_patch1/src",
+    "DIGI": "../CMSSW_10_6_17_patch1/src",
+    "HLT": "../CMSSW_10_2_16_UL/src",
+    "RECO": "../CMSSW_10_6_17_patch1/src",
+    "MINIAOD": "../CMSSW_10_6_17_patch1/src",
+    "NTUPLE": "../CMSSW_10_6_20/src/NtupleMaker/NtupleMaker/test"
+  },
+  "crab_projects_dirs": {
+    "GEN": "../CMSSW_10_6_20_patch1/src/crab_projects",
+    "SIM": "../CMSSW_10_6_17_patch1/src/crab_projects",
+    "DIGI": "../CMSSW_10_6_17_patch1/src/crab_projects",
+    "HLT": "../CMSSW_10_2_16_UL/src/crab_projects",
+    "RECO": "../CMSSW_10_6_17_patch1/src/crab_projects",
+    "MINIAOD": "../CMSSW_10_6_17_patch1/src/crab_projects",
+    "NTUPLE": "../CMSSW_10_6_20/src/NtupleMaker/NtupleMaker/test/crab_projects"
+  }
+}

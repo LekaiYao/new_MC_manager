@@ -1,5 +1,6 @@
 *.txt
 *.log
+.local/
 state/
 log/*.jsonl
 __pycache__/
