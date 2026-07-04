@@ -90,6 +90,7 @@ def extract_metadata_from_crab_log(job_dir, step):
     metadata = {
         'request_name': None,
         'output_dataset_tag': None,
+        'input_dataset': None,
         'sample_id': None,
     }
     if not os.path.exists(crab_log):
@@ -98,8 +99,11 @@ def extract_metadata_from_crab_log(job_dir, step):
         content = handle.read()
     request_match = re.search(r"config\.General\.requestName = '([^']+)'", content)
     tag_match = re.search(r"config\.Data\.outputDatasetTag = '([^']+)'", content)
+    input_match = re.search(r"config\.Data\.inputDataset = '([^']+)'", content)
     if request_match:
         metadata['request_name'] = request_match.group(1)
+    if input_match:
+        metadata['input_dataset'] = input_match.group(1)
     if tag_match:
         metadata['output_dataset_tag'] = tag_match.group(1)
         sample_match = re.search(r'MC2018_{0}_(.*)$'.format(step), metadata['output_dataset_tag'])
@@ -316,6 +320,7 @@ def collect_step_status(step, write_legacy_logs=True, config=None):
                 'generated_at': step_payload['generated_at'],
                 'flags': ['status_command_failed'],
                 'request_name': metadata['request_name'],
+                'input_dataset': metadata['input_dataset'],
             })
             legacy_log_lines.append(result.stderr.strip())
             legacy_log_lines.append('#' * 40)
@@ -341,6 +346,7 @@ def collect_step_status(step, write_legacy_logs=True, config=None):
             'flags': [],
             'request_name': metadata['request_name'],
             'output_dataset_tag': metadata['output_dataset_tag'],
+            'input_dataset': metadata['input_dataset'],
         }
         record['flags'] = classify_flags(record)
         step_payload['records'].append(record)
@@ -427,6 +433,8 @@ def merge_discovered_samples(state, config):
                 step_info['request_name'] = metadata['request_name']
             if metadata['output_dataset_tag']:
                 step_info['output_dataset_tag'] = metadata['output_dataset_tag']
+            if metadata['input_dataset']:
+                step_info['input_dataset'] = metadata['input_dataset']
             if sample['current_step'] is None or step_index(step, config) > step_index(sample['current_step'], config):
                 sample['current_step'] = step
                 sample['next_step'] = get_next_step(step, config)
@@ -451,6 +459,7 @@ def update_sample_from_status(sample, step, record, config):
         'job_counts': record.get('job_counts', {}),
         'resource_summary': record.get('resource_summary', {}),
         'output_dataset': record.get('output_dataset'),
+        'input_dataset': record.get('input_dataset') or step_info.get('input_dataset'),
         'output_dataset_tag': record.get('output_dataset_tag'),
         'finished_pct': record.get('job_counts', {}).get('finished_pct'),
         'transferring': record.get('job_counts', {}).get('transferring'),
@@ -538,19 +547,73 @@ def check_active_samples(config=None):
         'mode': 'lineage-latest',
     })
     return state, checked, skipped_ready, skipped_complete
-def infer_lineage_id(sample_id):
-    return re.sub(r'_v\d+_', '_', sample_id, count=1)
-
 def sample_version(sample_id):
     match = re.search(r'_v(\d+)_', sample_id)
     return int(match.group(1)) if match else 0
 
+def get_previous_step(step, config):
+    idx = step_index(step, config)
+    if idx <= 0:
+        return None
+    return config['steps'][idx - 1]
+
+def build_output_dataset_index(state):
+    output_index = {}
+    for sample_id, sample in state.get('samples', {}).items():
+        for step, step_info in sample.get('steps', {}).items():
+            dataset = step_info.get('output_dataset')
+            if dataset:
+                output_index[(step, dataset)] = sample_id
+    return output_index
+
+def build_sample_parent_map(state, config=None):
+    if config is None:
+        config = load_config()
+    output_index = build_output_dataset_index(state)
+    parent_map = {}
+    for sample_id, sample in state.get('samples', {}).items():
+        parent_id = None
+        for step in config['steps']:
+            step_info = sample.get('steps', {}).get(step)
+            if not step_info:
+                continue
+            previous_step = get_previous_step(step, config)
+            input_dataset = step_info.get('input_dataset')
+            if not previous_step or not input_dataset:
+                continue
+            candidate_parent = output_index.get((previous_step, input_dataset))
+            if candidate_parent and candidate_parent != sample_id:
+                parent_id = candidate_parent
+                break
+        parent_map[sample_id] = parent_id
+    return parent_map
+
+def resolve_lineage_root(sample_id, parent_map):
+    seen = set()
+    current = sample_id
+    while parent_map.get(current) and current not in seen:
+        seen.add(current)
+        current = parent_map[current]
+    return current
+
+def build_lineage_path(latest_sample_id, parent_map):
+    path = []
+    seen = set()
+    current = latest_sample_id
+    while current and current not in seen:
+        path.append(current)
+        seen.add(current)
+        current = parent_map.get(current)
+    path.reverse()
+    return path
+
 def build_lineage_view(state, config=None):
     if config is None:
         config = load_config()
+    parent_map = build_sample_parent_map(state, config)
     lineages = {}
     for sample_id, sample in state.get('samples', {}).items():
-        lineage_id = infer_lineage_id(sample_id)
+        lineage_id = resolve_lineage_root(sample_id, parent_map)
         entry = lineages.setdefault(lineage_id, {
             'lineage_id': lineage_id,
             'sample_ids': [],
@@ -559,6 +622,7 @@ def build_lineage_view(state, config=None):
             'steps': {},
             'completed_steps': {},
             'ready_candidates': [],
+            'path_sample_ids': [],
         })
         entry['sample_ids'].append(sample_id)
         latest_sample = entry['latest_sample']
@@ -576,22 +640,25 @@ def build_lineage_view(state, config=None):
         if use_latest:
             entry['latest_sample_id'] = sample_id
             entry['latest_sample'] = sample
-        if sample.get('ready_for_next_step'):
-            entry['ready_candidates'].append(sample_id)
-        for step, step_info in sample.get('steps', {}).items():
-            current = entry['steps'].get(step)
-            candidate_key = (sample_version(sample_id), sample_id)
-            current_key = (-1, '') if current is None else (sample_version(current['sample_id']), current['sample_id'])
-            merged = dict(step_info)
-            merged['sample_id'] = sample_id
-            if current is None or candidate_key >= current_key:
+    rendered = []
+    for lineage_id in sorted(lineages.keys()):
+        entry = lineages[lineage_id]
+        latest_sample_id = entry['latest_sample_id']
+        path_sample_ids = build_lineage_path(latest_sample_id, parent_map) if latest_sample_id else []
+        entry['path_sample_ids'] = path_sample_ids
+        entry['ready_candidates'] = []
+        for sample_id in path_sample_ids:
+            sample = state['samples'][sample_id]
+            if sample.get('ready_for_next_step'):
+                entry['ready_candidates'].append(sample_id)
+            for step, step_info in sample.get('steps', {}).items():
+                merged = dict(step_info)
+                merged['sample_id'] = sample_id
                 entry['steps'][step] = merged
-            if step_info.get('completed') and step_info.get('output_dataset'):
-                completed_current = entry['completed_steps'].get(step)
-                completed_key = (-1, '') if completed_current is None else (sample_version(completed_current['sample_id']), completed_current['sample_id'])
-                if completed_current is None or candidate_key >= completed_key:
+                if step_info.get('completed') and step_info.get('output_dataset'):
                     entry['completed_steps'][step] = merged
-    return [lineages[key] for key in sorted(lineages.keys())]
+        rendered.append(entry)
+    return rendered
 
 def format_bool(value):
     return 'yes' if value else 'no'
