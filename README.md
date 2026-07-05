@@ -15,7 +15,7 @@ python3 pipeline_driver.py check-active
 - 只检查每条 lineage 当前最新的未完成任务
 - 自动进入对应 `CMSSW` 的 `src` 目录
 - 自动执行 `cmssw-el7`、`scramv1 runtime -sh`、proxy 初始化/复用、`crab status`
-- 满足 `finished >= 95%` 且 `transferring == 0` 时，将该步标记为完成
+- 完成判据使用当前代码逻辑：`finished > 95%`、`publication done > 95%`、且两者差值 `<= 0.1%`
 - 已手动屏蔽的链不会进入自动检查
 
 ### 2. 查看下一步提交计划
@@ -59,6 +59,8 @@ python3 pipeline_driver.py table
 
 ### 5. 查看简要状态摘要
 
+`check-active` 的终端输出会同时显示 `finished`、`publication_done`、`transferring`、`ready`、`complete`。
+
 ```bash
 python3 pipeline_driver.py report
 ```
@@ -73,6 +75,14 @@ python3 pipeline_driver.py check GEN
 
 - 对单个 step 跑一次 `crab status`
 - 保留按 step 的传统日志输出
+
+## 判据说明
+
+当前代码中，单步状态分两层：
+
+- `completed`：`finished > 95%`、`publication done > 95%`、且 `|finished - publication_done| <= 0.1%`
+- `ready_for_next_step`：满足 `completed`，并且当前 step 已经有可用于下一步的 `output dataset`
+
 
 ## 本地配置
 
