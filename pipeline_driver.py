@@ -5,7 +5,7 @@ from pipeline_core import (
     STATE_FILE,
     TABLE_FILE,
     append_event,
-    build_submit_plan,
+    execute_submit_plan,
     check_active_samples,
     collect_step_status,
     load_config,
@@ -34,8 +34,8 @@ def cmd_check(args):
 
 def cmd_check_active(args):
     config = load_config()
-    state, checked, skipped_ready, skipped_complete = check_active_samples(config=config)
-    print(render_active_summary(checked, skipped_ready, skipped_complete))
+    state, checked, skipped_ready, skipped_complete, skipped_excluded = check_active_samples(config=config)
+    print(render_active_summary(checked, skipped_ready, skipped_complete, skipped_excluded))
     print('\nstate saved to: {0}'.format(STATE_FILE))
     return 0
 
@@ -66,15 +66,19 @@ def cmd_table(args):
 def cmd_submit_next(args):
     config = load_config()
     state = load_pipeline_state(config)
-    plan = build_submit_plan(state, config=config)
+    state, plan = execute_submit_plan(state, config=config, execute=args.execute)
     append_event(
-        'submit-next-dry-run',
+        'submit-next',
         {
+            'mode': plan.get('mode'),
             'planned_submissions': len(plan.get('submissions', [])),
             'blocked_lineages': len(plan.get('blocked', [])),
+            'results': len(plan.get('results', [])),
         },
     )
     print(render_submit_plan(plan))
+    if args.execute:
+        print('\nstate saved to: {0}'.format(STATE_FILE))
     return 0
 
 
@@ -110,8 +114,9 @@ def build_parser():
 
     submit_parser = subparsers.add_parser(
         'submit-next',
-        help='dry-run planner for the next-step submissions of ready lineages',
+        help='plan or execute the next-step submissions of ready lineages',
     )
+    submit_parser.add_argument('--execute', action='store_true', help='perform real crab submit calls and update state on success')
     submit_parser.set_defaults(func=cmd_submit_next)
 
     return parser

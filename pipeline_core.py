@@ -8,6 +8,7 @@ import tempfile
 MANAGER_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(MANAGER_DIR, 'config.json')
 LOCAL_VOMS_FILE = os.path.join(MANAGER_DIR, '.local', 'v.json')
+LOCAL_EXCLUSIONS_FILE = os.path.join(MANAGER_DIR, '.local', 'exclusions.json')
 STATE_DIR = os.path.join(MANAGER_DIR, 'state')
 LOG_DIR = os.path.join(MANAGER_DIR, 'log')
 TXT_DIR = os.path.join(MANAGER_DIR, 'txt')
@@ -35,6 +36,41 @@ def load_voms_password():
     if not password:
         raise RuntimeError('Missing voms_password in {0}'.format(LOCAL_VOMS_FILE))
     return password
+
+def load_exclusions():
+    payload = {}
+    if os.path.exists(LOCAL_EXCLUSIONS_FILE):
+        with open(LOCAL_EXCLUSIONS_FILE, 'r') as handle:
+            payload = json.load(handle)
+    return {
+        'excluded_lineages': set(payload.get('excluded_lineages', [])),
+        'excluded_samples': set(payload.get('excluded_samples', [])),
+        'excluded_request_names': set(payload.get('excluded_request_names', [])),
+        'excluded_crab_projects': set(payload.get('excluded_crab_projects', [])),
+    }
+
+def sample_matches_exclusions(sample_id, metadata, exclusions):
+    if sample_id in exclusions['excluded_samples']:
+        return True
+    if metadata.get('request_name') in exclusions['excluded_request_names']:
+        return True
+    crab_project_name = metadata.get('crab_project_name')
+    if crab_project_name in exclusions['excluded_crab_projects']:
+        return True
+    return False
+
+def lineage_matches_exclusions(lineage, exclusions):
+    if lineage.get('lineage_id') in exclusions['excluded_lineages']:
+        return True
+    for sample_id in lineage.get('sample_ids', []):
+        if sample_id in exclusions['excluded_samples']:
+            return True
+    for step_info in lineage.get('steps', {}).values():
+        if step_info.get('request_name') in exclusions['excluded_request_names']:
+            return True
+        if step_info.get('crab_project_name') in exclusions['excluded_crab_projects']:
+            return True
+    return False
 def step_index(step, config):
     return config['steps'].index(step)
 def get_next_step(step, config):
@@ -200,10 +236,16 @@ def parse_crab_status_output(stdout):
             'cpu_efficiency_pct': {'min': None, 'max': None, 'avg': None},
             'waste': {'value': None, 'fraction_pct': None},
         },
+        'publication': {
+            'available': False,
+            'done': 0,
+            'done_pct': None,
+        },
     }
     counts_pattern = re.compile(
         r'(idle|running|toRetry|unsubmitted|finished|failed|transferring)\s+([0-9.]+)%\s+\(([^)]+)\)'
     )
+    publication_pattern = re.compile(r'done\s+([0-9.]+)%\s+\(([^)]+)\)')
     for line in lines:
         stripped = line.strip()
         if line.startswith('Task name:'):
@@ -218,6 +260,15 @@ def parse_crab_status_output(stdout):
             record['output_dataset'] = line.split('Output dataset:')[-1].strip()
         elif stripped.startswith('Warning:'):
             record['warnings'].append(stripped)
+        elif 'No publication information available yet' in line:
+            record['publication']['available'] = False
+        if 'Publication status of' in line or record['publication']['available']:
+            publication_match = publication_pattern.search(line)
+            if publication_match:
+                pct, raw_count = publication_match.groups()
+                record['publication']['available'] = True
+                record['publication']['done_pct'] = _safe_float(pct)
+                record['publication']['done'] = parse_jobs_count(raw_count)
         match = counts_pattern.search(line)
         if match:
             state, pct, raw_count = match.groups()
@@ -416,14 +467,19 @@ def ensure_sample_state(sample_id, config):
         'next_step': None,
         'steps': {},
     }
-def merge_discovered_samples(state, config):
+def merge_discovered_samples(state, config, exclusions=None):
+    if exclusions is None:
+        exclusions = load_exclusions()
     active_steps = get_active_steps(config)
     for step in active_steps:
         for job_dir in get_crab_job_dirs(step, config):
             metadata = extract_metadata_from_crab_log(job_dir, step)
+            metadata['crab_project_name'] = os.path.basename(job_dir)
             sample_id = metadata['sample_id']
             if not sample_id:
                 sample_id = infer_sample_id(step, os.path.basename(job_dir), '')
+            if sample_matches_exclusions(sample_id, metadata, exclusions):
+                continue
             sample = state['samples'].setdefault(sample_id, ensure_sample_state(sample_id, config))
             step_info = sample['steps'].setdefault(step, {})
             step_info.setdefault('step', step)
@@ -441,10 +497,22 @@ def merge_discovered_samples(state, config):
                 if not sample.get('workflow_complete'):
                     sample['current_status'] = sample.get('current_status') or 'DISCOVERED'
     return state
+def cached_step_completed(step_info, config):
+    finished_pct = step_info.get('finished_pct')
+    publication_done_pct = step_info.get('publication_done_pct')
+    if finished_pct is None or publication_done_pct is None:
+        return False
+    threshold = float(config['finished_threshold_pct'])
+    return finished_pct > threshold and publication_done_pct > threshold and abs(finished_pct - publication_done_pct) <= 0.1
+
 def step_completed(record, config):
     finished_pct = record['job_counts'].get('finished_pct') or 0.0
-    transferring = record['job_counts'].get('transferring') or 0
-    return finished_pct >= float(config['finished_threshold_pct']) and transferring == 0
+    publication_done_pct = record.get('publication', {}).get('done_pct')
+    if publication_done_pct is None:
+        return False
+    threshold = float(config['finished_threshold_pct'])
+    pct_gap = abs(finished_pct - publication_done_pct)
+    return finished_pct > threshold and publication_done_pct > threshold and pct_gap <= 0.1
 def update_sample_from_status(sample, step, record, config):
     step_info = sample['steps'].setdefault(step, {})
     step_info.update({
@@ -463,6 +531,9 @@ def update_sample_from_status(sample, step, record, config):
         'output_dataset_tag': record.get('output_dataset_tag'),
         'finished_pct': record.get('job_counts', {}).get('finished_pct'),
         'transferring': record.get('job_counts', {}).get('transferring'),
+        'publication': record.get('publication', {}),
+        'publication_done': record.get('publication', {}).get('done'),
+        'publication_done_pct': record.get('publication', {}).get('done_pct'),
         'completed': False,
         'checked_at': utc_timestamp(),
     })
@@ -487,12 +558,18 @@ def check_active_samples(config=None):
     ensure_runtime_dirs()
     if config is None:
         config = load_config()
+    exclusions = load_exclusions()
     state = load_pipeline_state(config)
-    state = merge_discovered_samples(state, config)
+    state = merge_discovered_samples(state, config, exclusions=exclusions)
     checked = []
     skipped_ready = []
     skipped_complete = []
-    for lineage in build_lineage_view(state, config):
+    skipped_excluded = []
+    all_lineages = build_lineage_view(state, config, exclusions=None)
+    for lineage in all_lineages:
+        if lineage_matches_exclusions(lineage, exclusions):
+            skipped_excluded.append(lineage['lineage_id'])
+            continue
         lineage_id = lineage['lineage_id']
         sample_id = lineage.get('latest_sample_id')
         sample = lineage.get('latest_sample')
@@ -501,9 +578,15 @@ def check_active_samples(config=None):
         if sample.get('workflow_complete'):
             skipped_complete.append(lineage_id)
             continue
+        current_step = sample.get('current_step')
         if sample.get('ready_for_next_step'):
-            skipped_ready.append(lineage_id)
-            continue
+            cached_step = sample.get('steps', {}).get(current_step, {}) if current_step else {}
+            if cached_step_completed(cached_step, config):
+                skipped_ready.append(lineage_id)
+                continue
+            sample['ready_for_next_step'] = False
+            if sample.get('current_status') == 'READY_FOR_NEXT_STEP':
+                sample['current_status'] = cached_step.get('status')
         current_step = sample.get('current_step')
         if not current_step:
             continue
@@ -535,6 +618,7 @@ def check_active_samples(config=None):
             'status': sample['current_status'],
             'finished_pct': record['job_counts'].get('finished_pct'),
             'transferring': record['job_counts'].get('transferring'),
+            'publication_done_pct': record.get('publication', {}).get('done_pct'),
             'ready_for_next_step': sample['ready_for_next_step'],
             'workflow_complete': sample['workflow_complete'],
         })
@@ -545,8 +629,9 @@ def check_active_samples(config=None):
         'skipped_complete': skipped_complete,
         'terminal_step': config['terminal_step'],
         'mode': 'lineage-latest',
+        'skipped_excluded': skipped_excluded,
     })
-    return state, checked, skipped_ready, skipped_complete
+    return state, checked, skipped_ready, skipped_complete, skipped_excluded
 def sample_version(sample_id):
     match = re.search(r'_v(\d+)_', sample_id)
     return int(match.group(1)) if match else 0
@@ -607,9 +692,11 @@ def build_lineage_path(latest_sample_id, parent_map):
     path.reverse()
     return path
 
-def build_lineage_view(state, config=None):
+def build_lineage_view(state, config=None, exclusions=None):
     if config is None:
         config = load_config()
+    if exclusions is None:
+        exclusions = load_exclusions()
     parent_map = build_sample_parent_map(state, config)
     lineages = {}
     for sample_id, sample in state.get('samples', {}).items():
@@ -657,6 +744,8 @@ def build_lineage_view(state, config=None):
                 entry['steps'][step] = merged
                 if step_info.get('completed') and step_info.get('output_dataset'):
                     entry['completed_steps'][step] = merged
+        if lineage_matches_exclusions(entry, exclusions):
+            continue
         rendered.append(entry)
     return rendered
 
@@ -673,16 +762,145 @@ def format_lineage_status(lineage):
         'latest_sample_id': lineage.get('latest_sample_id') or '',
     }
 
-def build_submit_plan(state, config=None):
+def build_next_request_name(next_step, sample_id):
+    return 'MC2018_{0}_{1}'.format(next_step, sample_id)
+
+def update_crab_config_file(submission):
+    crab_config_file = submission['crab_config_file']
+    if not os.path.exists(crab_config_file):
+        raise RuntimeError('Missing CRAB config file: {0}'.format(crab_config_file))
+    with open(crab_config_file, 'r') as handle:
+        lines = handle.readlines()
+    updated = []
+    fields_seen = {
+        'inputDataset': False,
+        'requestName': False,
+        'outputDatasetTag': False,
+        'psetName': submission.get('pset_name') is None,
+    }
+    for line in lines:
+        if 'config.Data.inputDataset' in line:
+            updated.append("config.Data.inputDataset = '{0}'\n".format(submission['input_dataset']))
+            fields_seen['inputDataset'] = True
+        elif 'config.General.requestName' in line:
+            updated.append("config.General.requestName = '{0}'\n".format(submission['request_name']))
+            fields_seen['requestName'] = True
+        elif 'config.Data.outputDatasetTag' in line:
+            updated.append("config.Data.outputDatasetTag = '{0}'\n".format(submission['output_dataset_tag']))
+            fields_seen['outputDatasetTag'] = True
+        elif 'config.JobType.psetName' in line and submission.get('pset_name'):
+            updated.append("config.JobType.psetName = '{0}'\n".format(submission['pset_name']))
+            fields_seen['psetName'] = True
+        else:
+            updated.append(line)
+    missing = [key for key, seen in fields_seen.items() if not seen]
+    if missing:
+        raise RuntimeError('Missing required config fields in {0}: {1}'.format(crab_config_file, ', '.join(missing)))
+    with open(crab_config_file, 'w') as handle:
+        handle.writelines(updated)
+
+def register_submitted_step(state, submission, config, submit_result):
+    sample_id = submission['next_sample_id']
+    sample = state['samples'].setdefault(sample_id, ensure_sample_state(sample_id, config))
+    step = submission['next_step']
+    crab_project_name = 'crab_{0}'.format(submission['request_name'])
+    step_info = sample['steps'].setdefault(step, {})
+    step_info.update({
+        'step': step,
+        'request_name': submission['request_name'],
+        'task_name': None,
+        'crab_project_dir': os.path.join(get_crab_projects_dir(step, config), crab_project_name),
+        'crab_project_name': crab_project_name,
+        'status': 'SUBMITTED',
+        'dashboard_url': None,
+        'warnings': [],
+        'job_counts': {},
+        'resource_summary': {
+            'memory_mb': {'min': None, 'max': None, 'avg': None},
+            'runtime': {'min': None, 'max': None, 'avg': None},
+            'cpu_efficiency_pct': {'min': None, 'max': None, 'avg': None},
+            'waste': {'value': None, 'fraction_pct': None},
+        },
+        'output_dataset': None,
+        'input_dataset': submission['input_dataset'],
+        'output_dataset_tag': submission['output_dataset_tag'],
+        'finished_pct': None,
+        'transferring': 0,
+        'completed': False,
+        'checked_at': utc_timestamp(),
+        'submit_stdout': submit_result.stdout.strip(),
+        'submit_stderr': submit_result.stderr.strip(),
+    })
+    sample['current_step'] = step
+    sample['current_status'] = 'SUBMITTED'
+    sample['ready_for_next_step'] = False
+    sample['workflow_complete'] = False
+    sample['next_step'] = get_next_step(step, config)
+    sample.pop('last_error', None)
+    return sample
+
+def execute_submit_plan(state, config=None, execute=False):
     if config is None:
         config = load_config()
+    exclusions = load_exclusions()
+    plan = build_submit_plan(state, config=config, exclusions=exclusions)
+    plan['mode'] = 'execute' if execute else 'dry-run'
+    plan['results'] = []
+    if not execute:
+        return state, plan
+    for submission in plan.get('submissions', []):
+        try:
+            update_crab_config_file(submission)
+        except Exception as exc:
+            plan['results'].append({
+                'lineage_id': submission['lineage_id'],
+                'latest_sample_id': submission['latest_sample_id'],
+                'next_step': submission['next_step'],
+                'status': 'config_update_failed',
+                'message': str(exc),
+            })
+            continue
+        submit_result = run_in_cmssw_env(
+            submission['next_step'],
+            'crab submit -c {0}'.format(shlex.quote(os.path.basename(submission['crab_config_file']))),
+            config,
+            require_proxy=True,
+        )
+        if submit_result.returncode != 0:
+            plan['results'].append({
+                'lineage_id': submission['lineage_id'],
+                'latest_sample_id': submission['latest_sample_id'],
+                'next_step': submission['next_step'],
+                'status': 'submit_failed',
+                'return_code': submit_result.returncode,
+                'stdout': submit_result.stdout.strip(),
+                'stderr': submit_result.stderr.strip(),
+            })
+            continue
+        register_submitted_step(state, submission, config, submit_result)
+        plan['results'].append({
+            'lineage_id': submission['lineage_id'],
+            'latest_sample_id': submission['latest_sample_id'],
+            'next_step': submission['next_step'],
+            'status': 'submitted',
+            'stdout': submit_result.stdout.strip(),
+            'stderr': submit_result.stderr.strip(),
+        })
+    save_pipeline_state(state)
+    return state, plan
+
+def build_submit_plan(state, config=None, exclusions=None):
+    if config is None:
+        config = load_config()
+    if exclusions is None:
+        exclusions = load_exclusions()
     plan = {
         'generated_at': utc_timestamp(),
         'mode': 'dry-run',
         'submissions': [],
         'blocked': [],
     }
-    for lineage in build_lineage_view(state, config):
+    for lineage in build_lineage_view(state, config, exclusions=exclusions):
         latest_sample = lineage.get('latest_sample') or {}
         latest_sample_id = lineage.get('latest_sample_id')
         current_step = latest_sample.get('current_step')
@@ -730,16 +948,26 @@ def build_submit_plan(state, config=None):
                 'reason': 'missing_output_dataset',
             })
             continue
-        processed_dataset = _extract_processed_dataset(input_dataset)
-        next_dataset_name = processed_dataset.replace(current_step, next_step, 1) if processed_dataset else None
+        next_sample_id = latest_sample_id
+        request_name = build_next_request_name(next_step, next_sample_id)
+        existing_next = state.get('samples', {}).get(next_sample_id, {}).get('steps', {}).get(next_step)
+        if existing_next and existing_next.get('crab_project_dir'):
+            plan['blocked'].append({
+                'lineage_id': lineage['lineage_id'],
+                'latest_sample_id': latest_sample_id,
+                'current_step': current_step,
+                'reason': 'next_step_already_registered',
+            })
+            continue
         plan['submissions'].append({
             'lineage_id': lineage['lineage_id'],
             'latest_sample_id': latest_sample_id,
+            'next_sample_id': next_sample_id,
             'current_step': current_step,
             'next_step': next_step,
             'input_dataset': input_dataset,
-            'request_name': next_dataset_name,
-            'output_dataset_tag': next_dataset_name,
+            'request_name': request_name,
+            'output_dataset_tag': request_name,
             'work_dir': get_step_dir(next_step, config),
             'crab_config_file': os.path.join(get_step_dir(next_step, config), 'crab3_Config.py'),
             'pset_name': 'BPH_{0}_13TeV_cfg.py'.format(next_step) if next_step != 'NTUPLE' else None,
@@ -753,9 +981,22 @@ def render_submit_plan(plan):
     for item in plan.get('submissions', []):
         lines.append('  - {0}: {1} -> {2}'.format(item['lineage_id'], item['current_step'], item['next_step']))
         lines.append('    latest_sample_id={0}'.format(item['latest_sample_id']))
+        lines.append('    next_sample_id={0}'.format(item['next_sample_id']))
         lines.append('    input_dataset={0}'.format(item['input_dataset']))
         lines.append('    requestName={0}'.format(item['request_name']))
         lines.append('    crab_config={0}'.format(item['crab_config_file']))
+    if plan.get('results'):
+        lines.append('execution results: {0}'.format(len(plan['results'])))
+        for item in plan['results']:
+            lines.append('  - {0}: next_step={1}, status={2}'.format(
+                item.get('lineage_id'),
+                item.get('next_step', ''),
+                item.get('status'),
+            ))
+            if item.get('message'):
+                lines.append('    message={0}'.format(item['message']))
+            elif item.get('stderr'):
+                lines.append('    stderr={0}'.format(item['stderr']))
     lines.append('blocked lineages: {0}'.format(len(plan.get('blocked', []))))
     for item in plan.get('blocked', []):
         lines.append('  - {0}: reason={1}, current_step={2}, latest_sample_id={3}, ready_candidates={4}'.format(
@@ -775,7 +1016,7 @@ def write_table(state, config=None):
     lines = []
     lines.append('| ' + ' | '.join(columns) + ' |')
     lines.append('| ' + ' | '.join(['---'] * len(columns)) + ' |')
-    lineages = build_lineage_view(state, config)
+    lineages = build_lineage_view(state, config, exclusions=load_exclusions())
     for lineage in lineages:
         status = format_lineage_status(lineage)
         row = [lineage['lineage_id']]
@@ -793,19 +1034,23 @@ def write_table(state, config=None):
         handle.write('\n'.join(lines) + '\n')
     append_event('table', {'table_file': TABLE_FILE, 'lineages': len(lineages)})
     return TABLE_FILE
-def render_active_summary(checked, skipped_ready, skipped_complete):
+def render_active_summary(checked, skipped_ready, skipped_complete, skipped_excluded=None):
     lines = []
     lines.append('checked samples: {0}'.format(len(checked)))
     lines.append('ready-to-submit samples skipped: {0}'.format(len(skipped_ready)))
     lines.append('workflow-complete samples skipped: {0}'.format(len(skipped_complete)))
+    if skipped_excluded is None:
+        skipped_excluded = []
+    lines.append('manually excluded lineages skipped: {0}'.format(len(skipped_excluded)))
     for item in checked:
         lines.append(
-            '  - {0} ({1}): step={2}, status={3}, finished={4}, transferring={5}, ready={6}, complete={7}'.format(
+            '  - {0} ({1}): step={2}, status={3}, finished={4}, publication_done={5}, transferring={6}, ready={7}, complete={8}'.format(
                 item.get('lineage_id', item['sample_id']),
                 item['sample_id'],
                 item['step'],
                 item['status'],
                 item.get('finished_pct'),
+                item.get('publication_done_pct'),
                 item.get('transferring'),
                 item.get('ready_for_next_step'),
                 item.get('workflow_complete'),
