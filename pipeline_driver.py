@@ -5,6 +5,7 @@ from pipeline_core import (
     STATE_FILE,
     TABLE_FILE,
     append_event,
+    execute_resubmit_plan,
     execute_submit_plan,
     check_active_samples,
     collect_step_status,
@@ -12,6 +13,7 @@ from pipeline_core import (
     load_pipeline_state,
     render_active_summary,
     render_step_report,
+    render_resubmit_plan,
     render_submit_plan,
     write_table,
 )
@@ -82,6 +84,26 @@ def cmd_submit_next(args):
     return 0
 
 
+def cmd_resubmit(args):
+    config = load_config()
+    state = load_pipeline_state(config)
+    state, plan = execute_resubmit_plan(state, config=config, execute=args.execute, lineage_id=args.lineage)
+    append_event(
+        'resubmit',
+        {
+            'mode': plan.get('mode'),
+            'lineage_filter': plan.get('lineage_filter'),
+            'planned_resubmissions': len(plan.get('resubmissions', [])),
+            'blocked_lineages': len(plan.get('blocked', [])),
+            'results': len(plan.get('results', [])),
+        },
+    )
+    print(render_resubmit_plan(plan))
+    if args.execute:
+        print('\nstate saved to: {0}'.format(STATE_FILE))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description='new_MC_manager pipeline driver')
     subparsers = parser.add_subparsers(dest='command')
@@ -118,6 +140,14 @@ def build_parser():
     )
     submit_parser.add_argument('--execute', action='store_true', help='perform real crab submit calls and update state on success')
     submit_parser.set_defaults(func=cmd_submit_next)
+
+    resubmit_parser = subparsers.add_parser(
+        'resubmit',
+        help='plan or execute crab resubmit for the latest blocked lineage tasks',
+    )
+    resubmit_parser.add_argument('--execute', action='store_true', help='perform real crab resubmit calls and update state on success')
+    resubmit_parser.add_argument('--lineage', help='restrict resubmit planning/execution to one lineage id')
+    resubmit_parser.set_defaults(func=cmd_resubmit)
 
     return parser
 

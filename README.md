@@ -43,7 +43,32 @@ python3 pipeline_driver.py submit-next --execute
 - 成功提交后立即更新 `state/pipeline_state.json`
 - 已手动屏蔽的链不会进入自动提交
 
-### 4. 生成当前链路状态表
+### 4. 查看重新提交计划
+
+```bash
+python3 pipeline_driver.py resubmit
+```
+
+作用：
+
+- 只做 dry-run，不会真实重提
+- 只考虑每条 lineage 当前最新任务
+- 当前重提判据：`publication done + failed > 95%`，且该任务还不能进入下一步
+- 列出哪些 lineage 会被 `crab resubmit`，以及哪些 lineage 被阻塞
+
+### 5. 真实重新提交
+
+```bash
+python3 pipeline_driver.py resubmit --execute
+```
+
+作用：
+
+- 对符合条件的 lineage 执行真实 `crab resubmit -d ...`
+- 成功后在 `state/pipeline_state.json` 中记录 `resubmit_count` 和最近一次重提信息
+
+
+### 6. 生成当前链路状态表
 
 ```bash
 python3 pipeline_driver.py table
@@ -57,7 +82,7 @@ python3 pipeline_driver.py table
 - 只有满足完成判定的步骤才填 `output dataset`
 - 已手动屏蔽的链不会出现在表格里
 
-### 5. 查看简要状态摘要
+### 7. 查看简要状态摘要
 
 `check-active` 的终端输出会同时显示 `finished`、`publication_done`、`transferring`、`ready`、`complete`。
 
@@ -65,7 +90,7 @@ python3 pipeline_driver.py table
 python3 pipeline_driver.py report
 ```
 
-### 6. 手动按 step 做一次检查
+### 8. 手动按 step 做一次检查
 
 ```bash
 python3 pipeline_driver.py check GEN

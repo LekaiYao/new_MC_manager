@@ -1013,7 +1013,196 @@ def render_submit_plan(plan):
         ))
     return '\n'.join(lines)
 
+def build_resubmit_plan(state, config=None, exclusions=None, lineage_id=None):
+    if config is None:
+        config = load_config()
+    if exclusions is None:
+        exclusions = load_exclusions()
+    plan = {
+        'generated_at': utc_timestamp(),
+        'mode': 'dry-run',
+        'lineage_filter': lineage_id,
+        'resubmissions': [],
+        'blocked': [],
+    }
+    threshold = float(config['finished_threshold_pct'])
+    matched_lineages = 0
+    for lineage in build_lineage_view(state, config, exclusions=exclusions):
+        if lineage_id and lineage.get('lineage_id') != lineage_id:
+            continue
+        matched_lineages += 1
+        latest_sample = lineage.get('latest_sample') or {}
+        latest_sample_id = lineage.get('latest_sample_id')
+        current_step = latest_sample.get('current_step')
+        current_status = latest_sample.get('current_status')
+        if not latest_sample_id or not current_step:
+            plan['blocked'].append({
+                'lineage_id': lineage['lineage_id'],
+                'reason': 'missing_current_step',
+            })
+            continue
+        if latest_sample.get('workflow_complete'):
+            plan['blocked'].append({
+                'lineage_id': lineage['lineage_id'],
+                'latest_sample_id': latest_sample_id,
+                'current_step': current_step,
+                'reason': 'workflow_complete',
+            })
+            continue
+        if latest_sample.get('ready_for_next_step'):
+            plan['blocked'].append({
+                'lineage_id': lineage['lineage_id'],
+                'latest_sample_id': latest_sample_id,
+                'current_step': current_step,
+                'reason': 'already_ready_for_next_step',
+            })
+            continue
+        step_info = latest_sample.get('steps', {}).get(current_step, {})
+        crab_project_dir = step_info.get('crab_project_dir')
+        if not crab_project_dir:
+            plan['blocked'].append({
+                'lineage_id': lineage['lineage_id'],
+                'latest_sample_id': latest_sample_id,
+                'current_step': current_step,
+                'reason': 'missing_crab_project_dir',
+            })
+            continue
+        finished_pct = step_info.get('finished_pct') or 0.0
+        failed_pct = step_info.get('job_counts', {}).get('failed_pct') or 0.0
+        publication_done_pct = step_info.get('publication_done_pct')
+        publication_for_threshold = publication_done_pct or 0.0
+        if publication_for_threshold + failed_pct <= threshold:
+            plan['blocked'].append({
+                'lineage_id': lineage['lineage_id'],
+                'latest_sample_id': latest_sample_id,
+                'current_step': current_step,
+                'reason': 'resubmit_threshold_not_met',
+                'finished_pct': finished_pct,
+                'failed_pct': failed_pct,
+                'publication_done_pct': publication_done_pct,
+            })
+            continue
+        plan['resubmissions'].append({
+            'lineage_id': lineage['lineage_id'],
+            'latest_sample_id': latest_sample_id,
+            'current_step': current_step,
+            'current_status': current_status,
+            'crab_project_dir': crab_project_dir,
+            'finished_pct': finished_pct,
+            'failed_pct': failed_pct,
+            'running_pct': step_info.get('job_counts', {}).get('running_pct'),
+            'publication_done_pct': publication_done_pct,
+            'transferring': step_info.get('transferring'),
+            'resubmit_count': step_info.get('resubmit_count', 0),
+        })
+    if lineage_id and matched_lineages == 0:
+        plan['blocked'].append({
+            'lineage_id': lineage_id,
+            'reason': 'lineage_not_found_or_excluded',
+        })
+    return plan
+
+
+def register_resubmitted_step(state, resubmission, config, resubmit_result):
+    sample = state['samples'][resubmission['latest_sample_id']]
+    step = resubmission['current_step']
+    step_info = sample['steps'][step]
+    step_info['status'] = 'RESUBMITTED'
+    step_info['checked_at'] = utc_timestamp()
+    step_info['last_resubmit_at'] = utc_timestamp()
+    step_info['resubmit_count'] = int(step_info.get('resubmit_count', 0) or 0) + 1
+    step_info['last_resubmit_stdout'] = resubmit_result.stdout.strip()
+    step_info['last_resubmit_stderr'] = resubmit_result.stderr.strip()
+    sample['current_status'] = 'RESUBMITTED'
+    sample['ready_for_next_step'] = False
+    sample['workflow_complete'] = False
+    sample.pop('last_error', None)
+    return sample
+
+
+def execute_resubmit_plan(state, config=None, execute=False, lineage_id=None):
+    if config is None:
+        config = load_config()
+    exclusions = load_exclusions()
+    plan = build_resubmit_plan(state, config=config, exclusions=exclusions, lineage_id=lineage_id)
+    plan['mode'] = 'execute' if execute else 'dry-run'
+    plan['results'] = []
+    if not execute:
+        return state, plan
+    for resubmission in plan.get('resubmissions', []):
+        result = run_in_cmssw_env(
+            resubmission['current_step'],
+            'crab resubmit -d {0}'.format(shlex.quote(resubmission['crab_project_dir'])),
+            config,
+            require_proxy=True,
+        )
+        if result.returncode != 0:
+            plan['results'].append({
+                'lineage_id': resubmission['lineage_id'],
+                'latest_sample_id': resubmission['latest_sample_id'],
+                'current_step': resubmission['current_step'],
+                'status': 'resubmit_failed',
+                'return_code': result.returncode,
+                'stdout': result.stdout.strip(),
+                'stderr': result.stderr.strip(),
+            })
+            continue
+        register_resubmitted_step(state, resubmission, config, result)
+        plan['results'].append({
+            'lineage_id': resubmission['lineage_id'],
+            'latest_sample_id': resubmission['latest_sample_id'],
+            'current_step': resubmission['current_step'],
+            'status': 'resubmitted',
+            'stdout': result.stdout.strip(),
+            'stderr': result.stderr.strip(),
+        })
+    save_pipeline_state(state)
+    return state, plan
+
+
+def render_resubmit_plan(plan):
+    lines = []
+    lines.append('resubmit mode: {0}'.format(plan.get('mode', 'dry-run')))
+    if plan.get('lineage_filter'):
+        lines.append('lineage filter: {0}'.format(plan['lineage_filter']))
+    lines.append('planned resubmissions: {0}'.format(len(plan.get('resubmissions', []))))
+    for item in plan.get('resubmissions', []):
+        lines.append('  - {0}: step={1}, sample={2}'.format(item['lineage_id'], item['current_step'], item['latest_sample_id']))
+        lines.append('    finished={0}, failed={1}, publication_done={2}, running={3}, transferring={4}, resubmit_count={5}'.format(
+            format_scalar(item.get('finished_pct')),
+            format_scalar(item.get('failed_pct')),
+            format_scalar(item.get('publication_done_pct')),
+            format_scalar(item.get('running_pct')),
+            format_scalar(item.get('transferring')),
+            format_scalar(item.get('resubmit_count')),
+        ))
+        lines.append('    crab_project_dir={0}'.format(item['crab_project_dir']))
+    if plan.get('results'):
+        lines.append('execution results: {0}'.format(len(plan['results'])))
+        for item in plan['results']:
+            lines.append('  - {0}: step={1}, status={2}'.format(
+                item.get('lineage_id'),
+                item.get('current_step', ''),
+                item.get('status'),
+            ))
+            if item.get('stderr'):
+                lines.append('    stderr={0}'.format(item['stderr']))
+    lines.append('blocked lineages: {0}'.format(len(plan.get('blocked', []))))
+    for item in plan.get('blocked', []):
+        lines.append('  - {0}: reason={1}, current_step={2}, latest_sample_id={3}, finished={4}, failed={5}, publication_done={6}'.format(
+            item.get('lineage_id'),
+            item.get('reason'),
+            item.get('current_step', ''),
+            item.get('latest_sample_id', ''),
+            format_scalar(item.get('finished_pct')),
+            format_scalar(item.get('failed_pct')),
+            format_scalar(item.get('publication_done_pct')),
+        ))
+    return '\n'.join(lines)
+
+
 def write_table(state, config=None):
+
     ensure_runtime_dirs()
     if config is None:
         config = load_config()
