@@ -617,6 +617,8 @@ def check_active_samples(config=None):
             'step': current_step,
             'status': sample['current_status'],
             'finished_pct': record['job_counts'].get('finished_pct'),
+            'running_pct': record['job_counts'].get('running_pct'),
+            'failed_pct': record['job_counts'].get('failed_pct'),
             'transferring': record['job_counts'].get('transferring'),
             'publication_done_pct': record.get('publication', {}).get('done_pct'),
             'ready_for_next_step': sample['ready_for_next_step'],
@@ -751,6 +753,9 @@ def build_lineage_view(state, config=None, exclusions=None):
 
 def format_bool(value):
     return 'yes' if value else 'no'
+
+def format_scalar(value):
+    return '-' if value is None else str(value)
 
 def format_lineage_status(lineage):
     latest_sample = lineage.get('latest_sample') or {}
@@ -1044,16 +1049,18 @@ def render_active_summary(checked, skipped_ready, skipped_complete, skipped_excl
     lines.append('manually excluded lineages skipped: {0}'.format(len(skipped_excluded)))
     for item in checked:
         lines.append(
-            '  - {0} ({1}): step={2}, status={3}, finished={4}, publication_done={5}, transferring={6}, ready={7}, complete={8}'.format(
+            '  - {0} ({1}): step={2}, status={3}, finished={4}, publication_done={5}, running={6}, failed={7}, transferring={8}, ready={9}, complete={10}'.format(
                 item.get('lineage_id', item['sample_id']),
                 item['sample_id'],
                 item['step'],
-                item['status'],
-                item.get('finished_pct'),
-                item.get('publication_done_pct'),
-                item.get('transferring'),
-                item.get('ready_for_next_step'),
-                item.get('workflow_complete'),
+                format_scalar(item.get('status')),
+                format_scalar(item.get('finished_pct')),
+                format_scalar(item.get('publication_done_pct')),
+                format_scalar(item.get('running_pct')),
+                format_scalar(item.get('failed_pct')),
+                format_scalar(item.get('transferring')),
+                format_scalar(item.get('ready_for_next_step')),
+                format_scalar(item.get('workflow_complete')),
             )
         )
     return '\n'.join(lines)
