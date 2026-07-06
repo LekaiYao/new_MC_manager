@@ -618,6 +618,7 @@ def check_active_samples(config=None):
             'status': sample['current_status'],
             'finished_pct': record['job_counts'].get('finished_pct'),
             'running_pct': record['job_counts'].get('running_pct'),
+            'idle_pct': record['job_counts'].get('idle_pct'),
             'failed_pct': record['job_counts'].get('failed_pct'),
             'transferring': record['job_counts'].get('transferring'),
             'publication_done_pct': record.get('publication', {}).get('done_pct'),
@@ -782,6 +783,8 @@ def update_crab_config_file(submission):
         'requestName': False,
         'outputDatasetTag': False,
         'psetName': submission.get('pset_name') is None,
+        'numCores': submission.get('num_cores') is None,
+        'maxMemoryMB': submission.get('max_memory_mb') is None,
     }
     for line in lines:
         if 'config.Data.inputDataset' in line:
@@ -964,6 +967,7 @@ def build_submit_plan(state, config=None, exclusions=None):
                 'reason': 'next_step_already_registered',
             })
             continue
+        step_resources = config.get('step_resources', {}).get(next_step, {})
         plan['submissions'].append({
             'lineage_id': lineage['lineage_id'],
             'latest_sample_id': latest_sample_id,
@@ -976,6 +980,8 @@ def build_submit_plan(state, config=None, exclusions=None):
             'work_dir': get_step_dir(next_step, config),
             'crab_config_file': os.path.join(get_step_dir(next_step, config), 'crab3_Config.py'),
             'pset_name': 'BPH_{0}_13TeV_cfg.py'.format(next_step) if next_step != 'NTUPLE' else None,
+            'num_cores': step_resources.get('numCores'),
+            'max_memory_mb': step_resources.get('maxMemoryMB'),
         })
     return plan
 
@@ -1238,7 +1244,7 @@ def render_active_summary(checked, skipped_ready, skipped_complete, skipped_excl
     lines.append('manually excluded lineages skipped: {0}'.format(len(skipped_excluded)))
     for item in checked:
         lines.append(
-            '  - {0} ({1}): step={2}, status={3}, finished={4}, publication_done={5}, running={6}, failed={7}, transferring={8}, ready={9}, complete={10}'.format(
+            '  - {0} ({1}): step={2}, status={3}, finished={4}, publication_done={5}, running={6}, idle={7}, failed={8}, transferring={9}, ready={10}, complete={11}'.format(
                 item.get('lineage_id', item['sample_id']),
                 item['sample_id'],
                 item['step'],
@@ -1246,6 +1252,7 @@ def render_active_summary(checked, skipped_ready, skipped_complete, skipped_excl
                 format_scalar(item.get('finished_pct')),
                 format_scalar(item.get('publication_done_pct')),
                 format_scalar(item.get('running_pct')),
+                format_scalar(item.get('idle_pct')),
                 format_scalar(item.get('failed_pct')),
                 format_scalar(item.get('transferring')),
                 format_scalar(item.get('ready_for_next_step')),

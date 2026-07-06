@@ -2,7 +2,15 @@
   "terminal_step": "MINIAOD",
   "finished_threshold_pct": 95,
   "proxy_min_timeleft_seconds": 43200,
-  "steps": ["GEN", "SIM", "DIGI", "HLT", "RECO", "MINIAOD", "NTUPLE"],
+  "steps": [
+    "GEN",
+    "SIM",
+    "DIGI",
+    "HLT",
+    "RECO",
+    "MINIAOD",
+    "NTUPLE"
+  ],
   "step_dirs": {
     "GEN": "../CMSSW_10_6_20_patch1/src",
     "SIM": "../CMSSW_10_6_17_patch1/src",
@@ -20,5 +28,35 @@
     "RECO": "../CMSSW_10_6_17_patch1/src/crab_projects",
     "MINIAOD": "../CMSSW_10_6_17_patch1/src/crab_projects",
     "NTUPLE": "../CMSSW_10_6_20/src/NtupleMaker/NtupleMaker/test/crab_projects"
+  },
+  "step_resources": {
+    "GEN": {
+      "numCores": null,
+      "maxMemoryMB": null
+    },
+    "SIM": {
+      "numCores": 1,
+      "maxMemoryMB": 2000
+    },
+    "DIGI": {
+      "numCores": 1,
+      "maxMemoryMB": 2000
+    },
+    "HLT": {
+      "numCores": 1,
+      "maxMemoryMB": 2000
+    },
+    "RECO": {
+      "numCores": 2,
+      "maxMemoryMB": 4000
+    },
+    "MINIAOD": {
+      "numCores": 1,
+      "maxMemoryMB": 2000
+    },
+    "NTUPLE": {
+      "numCores": 1,
+      "maxMemoryMB": 2000
+    }
   }
 }

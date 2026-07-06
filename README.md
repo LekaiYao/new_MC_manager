@@ -103,11 +103,20 @@ python3 pipeline_driver.py check GEN
 
 ## 判据说明
 
-当前代码中，单步状态分两层：
+当前代码中，自动决策相关的状态与判据如下：
 
-- `completed`：`finished > 95%`、`publication done > 95%`、且 `|finished - publication_done| <= 0.1%`
-- `ready_for_next_step`：满足 `completed`，并且当前 step 已经有可用于下一步的 `output dataset`
-
+- `ready_for_next_step`
+  - `finished > 95%`
+  - `publication done > 95%`
+  - `|finished - publication_done| <= 0.1%`
+  - 当前 step 已经有可用于下一步的 `output dataset`
+- `workflow_complete`
+  - 先满足 `ready_for_next_step` 的完成判据
+  - 且当前 step 已经是配置中的 `terminal_step`
+- `resubmit` 候选
+  - 只看每条 lineage 当前最新任务
+  - 当前不能进入下一步
+  - `publication done + failed > 95%`
 
 ## 本地配置
 
@@ -115,7 +124,7 @@ python3 pipeline_driver.py check GEN
 
 ```json
 {
-  "voms_password": "111111"
+  "voms_password": "<local-only>"
 }
 ```
 
