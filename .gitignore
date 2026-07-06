@@ -4,3 +4,5 @@
 state/
 log/*.jsonl
 __pycache__/
+AGENTS.md
+codex*.md

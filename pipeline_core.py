@@ -7,7 +7,6 @@ import subprocess
 import tempfile
 MANAGER_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(MANAGER_DIR, 'config.json')
-LOCAL_VOMS_FILE = os.path.join(MANAGER_DIR, '.local', 'v.json')
 LOCAL_EXCLUSIONS_FILE = os.path.join(MANAGER_DIR, '.local', 'exclusions.json')
 STATE_DIR = os.path.join(MANAGER_DIR, 'state')
 LOG_DIR = os.path.join(MANAGER_DIR, 'log')
@@ -15,6 +14,11 @@ TXT_DIR = os.path.join(MANAGER_DIR, 'txt')
 STATE_FILE = os.path.join(STATE_DIR, 'pipeline_state.json')
 EVENTS_FILE = os.path.join(LOG_DIR, 'pipeline_events.jsonl')
 TABLE_FILE = os.path.join(STATE_DIR, 'pipeline_table.md')
+BLUE = '\033[94m'
+GREEN = '\033[92m'
+ORANGE = '\033[38;5;214m'
+GRAY = '\033[90m'
+RESET = '\033[0m'
 _PROXY_READY = False
 def ensure_runtime_dirs():
     for path in (STATE_DIR, LOG_DIR, TXT_DIR):
@@ -27,16 +31,6 @@ def load_config():
         config = json.load(handle)
     config['allowed_steps'] = set(config['steps'])
     return config
-def load_voms_password():
-    if not os.path.exists(LOCAL_VOMS_FILE):
-        raise RuntimeError('Missing local VOMS password file: {0}'.format(LOCAL_VOMS_FILE))
-    with open(LOCAL_VOMS_FILE, 'r') as handle:
-        payload = json.load(handle)
-    password = payload.get('voms_password')
-    if not password:
-        raise RuntimeError('Missing voms_password in {0}'.format(LOCAL_VOMS_FILE))
-    return password
-
 def load_exclusions():
     payload = {}
     if os.path.exists(LOCAL_EXCLUSIONS_FILE):
@@ -189,16 +183,13 @@ def ensure_proxy(step, config):
     global _PROXY_READY
     if _PROXY_READY:
         return subprocess.CompletedProcess(args=['proxy-cache'], returncode=0, stdout='cached', stderr='')
-    password = load_voms_password()
-    env = os.environ.copy()
-    env['NEW_MC_VOMS_PASSWORD'] = password
     script_body = (
         'if ! voms-proxy-info -exists -valid 12:00 >/dev/null 2>&1; then\n'
-        '  printf %s\\n "$NEW_MC_VOMS_PASSWORD" | voms-proxy-init --rfc --voms cms --valid 192:00 >/dev/null\n'
+        '  voms-proxy-init --rfc --voms cms --valid 192:00 >/dev/null\n'
         'fi\n'
         'voms-proxy-info -timeleft\n'
     )
-    result = run_cmssw_script(step, script_body, config, env=env)
+    result = run_cmssw_script(step, script_body, config)
     if result.returncode == 0:
         _PROXY_READY = True
     return result
@@ -611,6 +602,10 @@ def check_active_samples(config=None):
         record['crab_project_name'] = step_info.get('crab_project_name')
         record['output_dataset_tag'] = step_info.get('output_dataset_tag')
         update_sample_from_status(sample, current_step, record, config)
+        finished_pct = record['job_counts'].get('finished_pct') or 0.0
+        failed_pct = record['job_counts'].get('failed_pct') or 0.0
+        publication_done_pct = record.get('publication', {}).get('done_pct')
+        publication_for_threshold = publication_done_pct or 0.0
         checked.append({
             'lineage_id': lineage_id,
             'sample_id': sample_id,
@@ -621,9 +616,10 @@ def check_active_samples(config=None):
             'idle_pct': record['job_counts'].get('idle_pct'),
             'failed_pct': record['job_counts'].get('failed_pct'),
             'transferring': record['job_counts'].get('transferring'),
-            'publication_done_pct': record.get('publication', {}).get('done_pct'),
+            'publication_done_pct': publication_done_pct,
             'ready_for_next_step': sample['ready_for_next_step'],
             'workflow_complete': sample['workflow_complete'],
+            'resubmit_candidate': (not sample['ready_for_next_step']) and (not sample['workflow_complete']) and (publication_for_threshold + failed_pct > float(config['finished_threshold_pct'])),
         })
     save_pipeline_state(state)
     append_event('check-active', {
@@ -757,6 +753,30 @@ def format_bool(value):
 
 def format_scalar(value):
     return '-' if value is None else str(value)
+
+def colorize(text, color):
+    return '{0}{1}{2}'.format(color, text, RESET)
+
+def build_check_status_label(item):
+    labels = []
+    if item.get('workflow_complete'):
+        labels.append(colorize('DONE', GREEN))
+    elif item.get('ready_for_next_step'):
+        labels.append(colorize('READY_NEXT', GREEN))
+    if item.get('resubmit_candidate'):
+        labels.append(colorize('READY_RESUBMIT', ORANGE))
+    base_status = item.get('status')
+    if not labels:
+        labels.append(format_scalar(base_status))
+    elif base_status not in (None, 'READY_FOR_NEXT_STEP', 'WORKFLOW_COMPLETE'):
+        labels.insert(0, format_scalar(base_status))
+    return '/'.join(labels)
+
+def format_field_with_color(value, color=None):
+    rendered = format_scalar(value)
+    if color and rendered != '-':
+        return colorize(rendered, color)
+    return rendered
 
 def format_lineage_status(lineage):
     latest_sample = lineage.get('latest_sample') or {}
@@ -1245,18 +1265,18 @@ def render_active_summary(checked, skipped_ready, skipped_complete, skipped_excl
     for item in checked:
         lines.append(
             '  - {0} ({1}): step={2}, status={3}, finished={4}, publication_done={5}, running={6}, idle={7}, failed={8}, transferring={9}, ready={10}, complete={11}'.format(
-                item.get('lineage_id', item['sample_id']),
-                item['sample_id'],
+                colorize(item.get('lineage_id', item['sample_id']), BLUE),
+                colorize(item['sample_id'], BLUE),
                 item['step'],
-                format_scalar(item.get('status')),
-                format_scalar(item.get('finished_pct')),
-                format_scalar(item.get('publication_done_pct')),
-                format_scalar(item.get('running_pct')),
-                format_scalar(item.get('idle_pct')),
-                format_scalar(item.get('failed_pct')),
-                format_scalar(item.get('transferring')),
-                format_scalar(item.get('ready_for_next_step')),
-                format_scalar(item.get('workflow_complete')),
+                build_check_status_label(item),
+                format_field_with_color(item.get('finished_pct')),
+                format_field_with_color(item.get('publication_done_pct'), GREEN),
+                format_field_with_color(item.get('running_pct')),
+                format_field_with_color(item.get('idle_pct'), GRAY),
+                format_field_with_color(item.get('failed_pct'), ORANGE),
+                format_field_with_color(item.get('transferring')),
+                format_field_with_color(item.get('ready_for_next_step')),
+                format_field_with_color(item.get('workflow_complete')),
             )
         )
     return '\n'.join(lines)
