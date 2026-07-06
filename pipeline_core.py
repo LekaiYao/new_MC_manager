@@ -15,8 +15,10 @@ STATE_FILE = os.path.join(STATE_DIR, 'pipeline_state.json')
 EVENTS_FILE = os.path.join(LOG_DIR, 'pipeline_events.jsonl')
 TABLE_FILE = os.path.join(STATE_DIR, 'pipeline_table.md')
 BLUE = '\033[94m'
-GREEN = '\033[92m'
+GREEN = '\033[32m'
 ORANGE = '\033[38;5;214m'
+BROWN = '\033[38;5;130m'
+RED = '\033[91m'
 GRAY = '\033[90m'
 RESET = '\033[0m'
 _PROXY_READY = False
@@ -1264,18 +1266,17 @@ def render_active_summary(checked, skipped_ready, skipped_complete, skipped_excl
     lines.append('manually excluded lineages skipped: {0}'.format(len(skipped_excluded)))
     for item in checked:
         lines.append(
-            '  - {0} ({1}): step={2}, status={3}, finished={4}, publication_done={5}, running={6}, idle={7}, failed={8}, transferring={9}, ready={10}, complete={11}'.format(
+            '  - {0} ({1}): {2}, status={3}, finished={4}, {5}, running={6}, {7}, {8}, transferring={9}, complete={10}'.format(
                 colorize(item.get('lineage_id', item['sample_id']), BLUE),
                 colorize(item['sample_id'], BLUE),
-                item['step'],
+                colorize('step={0}'.format(item['step']), BROWN),
                 build_check_status_label(item),
                 format_field_with_color(item.get('finished_pct')),
-                format_field_with_color(item.get('publication_done_pct'), GREEN),
+                colorize('publication_done={0}'.format(format_scalar(item.get('publication_done_pct'))), GREEN),
                 format_field_with_color(item.get('running_pct')),
-                format_field_with_color(item.get('idle_pct'), GRAY),
-                format_field_with_color(item.get('failed_pct'), ORANGE),
+                colorize('idle={0}'.format(format_scalar(item.get('idle_pct'))), GRAY),
+                colorize('failed={0}'.format(format_scalar(item.get('failed_pct'))), RED),
                 format_field_with_color(item.get('transferring')),
-                format_field_with_color(item.get('ready_for_next_step')),
                 format_field_with_color(item.get('workflow_complete')),
             )
         )
